@@ -11,6 +11,8 @@ A 4-script Python pipeline that inventories documents, OCRs them page-by-page, i
 | `03_ingest_sample.py` | OCR labeled sample documents (single file or folder) to represent a known document type |
 | `04_match_documents.py` | Match inventory pages against samples to identify document types |
 | `05_feedback.py` | Flag false-positive matches and tune per-type thresholds automatically |
+| `06_extract_subdocuments.py` | Extract matched page ranges from parent files into individual PDFs |
+| `07_keywords.py` | Add, update, remove, and list per-type keyword boosts and penalties |
 
 ---
 
@@ -113,6 +115,12 @@ To enable feedback tracking, also run `db/schema_feedback.sql`:
 
 ```bash
 sqlcmd -S localhost -U sa -P your_password -d document_pipeline -i db/schema_feedback.sql
+```
+
+To enable keyword boosts/penalties, also run `db/schema_keywords.sql`:
+
+```bash
+sqlcmd -S localhost -U sa -P your_password -d document_pipeline -i db/schema_keywords.sql
 ```
 
 ---
@@ -255,6 +263,96 @@ Script 04 reads `match_feedback` on every run and automatically:
 
 ---
 
+### Step 7 — Manage keyword boosts and penalties
+
+Fine-tune matching scores by adding per-type keywords. A positive weight boosts the score when the keyword appears in a page; a negative weight penalizes it. Adjusted scores are clamped to the range [0.0, 1.5].
+
+```bash
+# Boost pages that contain "amount due" when matching as Invoice
+python scripts/07_keywords.py --add --type "Invoice" --keyword "amount due" --weight 0.15
+
+# Penalize Invoice matches when a competing term appears
+python scripts/07_keywords.py --add --type "Invoice" --keyword "deposit slip" --weight -0.20
+
+# Re-running --add with a new weight safely updates the existing entry
+python scripts/07_keywords.py --add --type "Invoice" --keyword "amount due" --weight 0.25
+
+# Remove by ID
+python scripts/07_keywords.py --remove --keyword-id 5
+
+# List all keywords
+python scripts/07_keywords.py --list
+
+# List keywords for one type
+python scripts/07_keywords.py --list --type "Invoice"
+```
+
+Example `--list` output:
+```
+ID  Type                  Keyword              Weight
+--  --------------------  -------------------  ------
+ 1  Invoice               amount due           +0.150
+ 2  Invoice               deposit slip         -0.200
+ 3  Lease Agreement       lease term           +0.100
+```
+
+After adding or changing keywords, re-run Script 04 to apply them:
+
+```bash
+python scripts/04_match_documents.py --regen
+```
+
+---
+
+### Step 6 — Extract subdocument PDFs
+
+Once matches are confirmed, extract each matched subdocument into its own PDF file. Multiple match segments of the same document type from the same parent file are automatically combined into one output PDF in page order.
+
+```bash
+# Extract all matched subdocuments into ./output/extracted/
+python scripts/06_extract_subdocuments.py
+
+# Write to a custom directory
+python scripts/06_extract_subdocuments.py --output-dir /path/to/output
+
+# Limit to one source document
+python scripts/06_extract_subdocuments.py --document-id 7
+
+# Limit to one document type
+python scripts/06_extract_subdocuments.py --document-type "Invoice"
+```
+
+Output files are organized by document type and named after their source document:
+
+```
+output/
+  extracted/
+    Invoice/
+      doc_7_Invoice.pdf        ← pages 1-2 and 15-16 combined (two match segments)
+    Lease_Agreement/
+      doc_7_Lease_Agreement.pdf
+      doc_12_Lease_Agreement.pdf
+```
+
+Example output:
+```
+Loading matches...
+Found 3 subdocument(s) to extract across 2 source file(s).
+
+  doc 7 / Invoice — pages 1-2, 15-16 (2 segments combined)
+    → output/extracted/Invoice/doc_7_Invoice.pdf
+  doc 7 / Lease Agreement — pages 5-8 (1 segment)
+    → output/extracted/Lease_Agreement/doc_7_Lease_Agreement.pdf
+  doc 12 / Lease Agreement — pages 3-6 (1 segment)
+    → output/extracted/Lease_Agreement/doc_12_Lease_Agreement.pdf
+
+Done. 3 file(s) written, 0 error(s).
+```
+
+PDF sources are extracted using `pypdf` (vector quality preserved). TIFF sources are extracted frame-by-frame and saved as PDF using Pillow.
+
+---
+
 ## Project Structure
 
 ```
@@ -266,13 +364,18 @@ Script 04 reads `match_feedback` on every run and automatically:
 ├── db/
 │   ├── connection.py          # pyodbc context manager
 │   ├── schema.sql             # DDL — run once against SQL Server
-│   └── schema_feedback.sql    # DDL — adds match_feedback table
+│   ├── schema_feedback.sql    # DDL — adds match_feedback table
+│   └── schema_keywords.sql    # DDL — adds type_keywords table
 ├── scripts/
 │   ├── 01_inventory.py
 │   ├── 02_ocr_processor.py
 │   ├── 03_ingest_sample.py
 │   ├── 04_match_documents.py
-│   └── 05_feedback.py
+│   ├── 05_feedback.py
+│   ├── 06_extract_subdocuments.py
+│   └── 07_keywords.py         # Manage per-type keyword boosts/penalties
+├── output/
+│   └── extracted/             # Default output for Script 06 (gitignored)
 └── utils/
     ├── ocr.py                 # Shared OCR logic (pdf2image + pytesseract)
     └── text_utils.py          # Text cleaning helpers
@@ -297,6 +400,12 @@ All settings are controlled via `.env`. Only `DB_*` values are required; the res
 | `SAMPLE_PAGE_EXCLUSION_COUNT` | No | `3` | False-match count at which a sample page is dropped from the corpus |
 | `OCR_DPI` | No | `300` | PDF render resolution |
 | `TESSERACT_LANG` | No | `eng` | Tesseract language(s) |
+| `TFIDF_STOP_WORDS` | No | _(none)_ | Set to `english` to strip common words from the TF-IDF vocabulary |
+| `TFIDF_MAX_DF` | No | `1.0` | Drop tokens that appear in more than this fraction of a type's sample pages |
+| `TFIDF_MIN_DF` | No | `1` | Drop tokens that appear in fewer than this many of a type's sample pages |
+| `TFIDF_NGRAM_MAX` | No | `2` | Upper bound of the n-gram range; `(1, N)` means unigrams through N-grams |
+| `TFIDF_MAX_FEATURES` | No | _(unlimited)_ | Cap vocabulary size per type; omit or leave blank for no cap |
+| `TFIDF_MIN_TYPE_SAMPLES` | No | `3` | Warn when a type has fewer than this many sample pages |
 
 ---
 
