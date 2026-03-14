@@ -9,16 +9,27 @@ import sys
 import os
 import argparse
 import traceback
+import socket
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import config
 from db.connection import get_connection
 from utils.ocr import ocr_document
 from utils.text_utils import clean_text, word_count
 
+WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
-def claim_next_document(conn) -> dict | None:
-    """Atomically claim the oldest pending document. Returns its row or None."""
+
+def claim_next_document(conn) -> dict | None | bool:
+    """Atomically claim the oldest pending document.
+
+    Returns:
+        dict  — claimed successfully
+        None  — queue is empty (no pending documents)
+        False — lost a race to another worker (retry)
+    """
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -35,16 +46,33 @@ def claim_next_document(conn) -> dict | None:
     cursor.execute(
         """
         UPDATE documents
-        SET ocr_status = 'processing', ocr_started_at = GETUTCDATE()
+        SET ocr_status = 'processing', ocr_started_at = GETUTCDATE(), worker_id = ?
         WHERE document_id = ? AND ocr_status = 'pending'
         """,
+        WORKER_ID,
         doc_id,
     )
     if cursor.rowcount == 0:
-        # Another process claimed it first
-        return None
+        # Another worker claimed it first — caller should retry
+        return False
     conn.commit()
     return {"document_id": doc_id, "file_path": file_path, "file_type": file_type}
+
+
+def reset_stale_claims(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE documents
+        SET ocr_status = 'pending', worker_id = NULL, ocr_started_at = NULL
+        WHERE ocr_status = 'processing'
+          AND ocr_started_at < DATEADD(MINUTE, -?, GETUTCDATE())
+        """,
+        config.OCR_STALE_MINUTES,
+    )
+    if cursor.rowcount > 0:
+        print(f"  [recovery] Reset {cursor.rowcount} stale claim(s) back to pending (timeout: {config.OCR_STALE_MINUTES} min)")
+    conn.commit()
 
 
 def process_document(doc: dict) -> None:
@@ -95,13 +123,19 @@ def mark_error(doc_id: int, error_msg: str) -> None:
 
 
 def run_once() -> bool:
-    """Claim and process one document. Returns True if work was done."""
+    """Claim and process one document. Returns True if the loop should continue."""
     with get_connection() as conn:
+        reset_stale_claims(conn)
         doc = claim_next_document(conn)
 
     if doc is None:
         print("No pending documents.")
         return False
+
+    if doc is False:
+        # Lost a race to another worker — keep looping
+        time.sleep(0.5)
+        return True
 
     try:
         process_document(doc)

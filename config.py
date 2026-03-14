@@ -24,6 +24,7 @@ FEEDBACK_PENALTY = float(os.getenv("FEEDBACK_PENALTY", "0.05"))
 SAMPLE_PAGE_EXCLUSION_COUNT = int(os.getenv("SAMPLE_PAGE_EXCLUSION_COUNT", "3"))
 OCR_DPI = int(os.getenv("OCR_DPI", "300"))
 TESSERACT_LANG = os.getenv("TESSERACT_LANG", "eng")
+OCR_STALE_MINUTES = int(os.getenv("OCR_STALE_MINUTES", "60"))
 
 # TF-IDF vectorizer hyperparameters
 _sw = os.getenv("TFIDF_STOP_WORDS", "")

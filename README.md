@@ -161,6 +161,28 @@ python scripts/02_ocr_processor.py --loop
 
 Each document's status moves through `pending → processing → complete` (or `error` on failure). If an error occurs, the message is stored in the `documents.ocr_error` column and processing continues with the next document.
 
+#### Running Multiple Workers
+
+To speed up OCR, you can run several instances of `02_ocr_processor.py` simultaneously across multiple servers or terminals. Workers self-coordinate through the database — no message broker or other infrastructure is needed.
+
+**Setup (once):** run the migration to add the worker tracking column:
+
+```bash
+sqlcmd -S localhost -U sa -P your_password -d document_pipeline -i db/schema_ocr_workers.sql
+```
+
+**Start workers** — each server runs independently:
+
+```bash
+python scripts/02_ocr_processor.py --loop
+```
+
+Each worker records its `hostname:PID` in the database when it claims a document, so you can see which server holds which document at any time.
+
+**Crash recovery:** if a worker is killed mid-processing, the document it held stays in `'processing'` state. The next time any healthy worker polls, it automatically resets documents that have been stuck longer than `OCR_STALE_MINUTES` back to `'pending'` so they are reprocessed.
+
+**Tip:** lower `OCR_DPI` (e.g., `OCR_DPI=150`) for a significant throughput improvement at a modest quality cost.
+
 ---
 
 ### Step 3 — Ingest sample documents
@@ -365,7 +387,8 @@ PDF sources are extracted using `pypdf` (vector quality preserved). TIFF sources
 │   ├── connection.py          # pyodbc context manager
 │   ├── schema.sql             # DDL — run once against SQL Server
 │   ├── schema_feedback.sql    # DDL — adds match_feedback table
-│   └── schema_keywords.sql    # DDL — adds type_keywords table
+│   ├── schema_keywords.sql    # DDL — adds type_keywords table
+│   └── schema_ocr_workers.sql # DDL — adds worker_id column for multi-worker support
 ├── scripts/
 │   ├── 01_inventory.py
 │   ├── 02_ocr_processor.py
@@ -400,6 +423,7 @@ All settings are controlled via `.env`. Only `DB_*` values are required; the res
 | `SAMPLE_PAGE_EXCLUSION_COUNT` | No | `3` | False-match count at which a sample page is dropped from the corpus |
 | `OCR_DPI` | No | `300` | PDF render resolution |
 | `TESSERACT_LANG` | No | `eng` | Tesseract language(s) |
+| `OCR_STALE_MINUTES` | No | `60` | Minutes before a stuck `'processing'` document is reset to `'pending'` (multi-worker crash recovery) |
 | `TFIDF_STOP_WORDS` | No | _(none)_ | Set to `english` to strip common words from the TF-IDF vocabulary |
 | `TFIDF_MAX_DF` | No | `1.0` | Drop tokens that appear in more than this fraction of a type's sample pages |
 | `TFIDF_MIN_DF` | No | `1` | Drop tokens that appear in fewer than this many of a type's sample pages |
