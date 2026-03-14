@@ -8,8 +8,9 @@ A 4-script Python pipeline that inventories documents, OCRs them page-by-page, i
 |--------|---------|
 | `01_inventory.py` | Walk a directory and register all PDF/TIFF files in the database |
 | `02_ocr_processor.py` | Pick pending documents, OCR each page, and store the extracted text |
-| `03_ingest_sample.py` | OCR a labeled sample document to represent a known document type |
+| `03_ingest_sample.py` | OCR labeled sample documents (single file or folder) to represent a known document type |
 | `04_match_documents.py` | Match inventory pages against samples to identify document types |
+| `05_feedback.py` | Flag false-positive matches and tune per-type thresholds automatically |
 
 ---
 
@@ -108,6 +109,12 @@ Or open `db/schema.sql` in SQL Server Management Studio (SSMS) / Azure Data Stud
 
 This creates five tables: `documents`, `document_pages`, `sample_documents`, `sample_pages`, and `document_matches`.
 
+To enable feedback tracking, also run `db/schema_feedback.sql`:
+
+```bash
+sqlcmd -S localhost -U sa -P your_password -d document_pipeline -i db/schema_feedback.sql
+```
+
 ---
 
 ## Running the Pipeline
@@ -150,20 +157,24 @@ Each document's status moves through `pending → processing → complete` (or `
 
 ### Step 3 — Ingest sample documents
 
-Provide labeled example files so the matcher knows what each document type looks like. Run this once per document type (or once per sample file).
+Provide labeled example files so the matcher knows what each document type looks like. You can pass either a single file or a folder. When a folder is given, every PDF/TIFF inside it is ingested under the same document type label.
 
 ```bash
+# Single file
 python scripts/03_ingest_sample.py /path/to/sample.pdf "Document Type Label"
+
+# Entire folder — all PDFs/TIFFs inside are ingested as the same type
+python scripts/03_ingest_sample.py /path/to/samples/invoices/ "Invoice"
 ```
 
 Examples:
 ```bash
-python scripts/03_ingest_sample.py samples/invoice_sample.pdf "Invoice"
+python scripts/03_ingest_sample.py samples/invoices/ "Invoice"
 python scripts/03_ingest_sample.py samples/w2_sample.pdf "W-2"
-python scripts/03_ingest_sample.py samples/lease_sample.pdf "Lease Agreement"
+python scripts/03_ingest_sample.py samples/lease_agreements/ "Lease Agreement"
 ```
 
-The script is idempotent — re-running with the same file path is a no-op.
+The script is idempotent — files already in the database are skipped, so it's safe to re-run.
 
 ---
 
@@ -172,13 +183,13 @@ The script is idempotent — re-running with the same file path is a no-op.
 Compare every page of every OCR'd inventory document against the sample corpus and write matches to `document_matches`.
 
 ```bash
-# Match all complete documents
+# Match all unmatched documents (safe to re-run — skips already-matched docs)
 python scripts/04_match_documents.py
 
 # Match a single document by ID
 python scripts/04_match_documents.py --document-id 7
 
-# Re-run matching (deletes existing matches before writing new ones)
+# Re-match everything, replacing all existing matches
 python scripts/04_match_documents.py --regen
 ```
 
@@ -201,6 +212,49 @@ Results are stored in `document_matches` with:
 
 ---
 
+### Step 5 — Record feedback and tune thresholds
+
+When you spot a false match in `document_matches`, flag it so Script 04 will suppress similar matches in future runs.
+
+```bash
+# Flag match 42 as a false positive
+python scripts/05_feedback.py --match-id 42
+
+# Flag with an explanatory note
+python scripts/05_feedback.py --match-id 42 --note "This is a receipt, not an invoice"
+
+# Review per-type stats and recommended thresholds before re-running Script 04
+python scripts/05_feedback.py --report
+
+# List all recorded feedback
+python scripts/05_feedback.py --list
+```
+
+Example `--report` output:
+```
+Document Type        | False Matches | Score Range      | Recommended Threshold | Current
+---------------------|---------------|------------------|-----------------------|--------
+Invoice              |             4 | 0.38 – 0.54      |                  0.59 |    0.35
+Lease Agreement      |             1 | 0.41 – 0.41      |                  0.46 |    0.35
+
+Excluded sample pages (≥3 false matches):
+  sample_id=7, page=2  (4 false matches) — type: Invoice
+```
+
+After recording feedback, re-run Script 04 to apply the adjusted thresholds:
+
+```bash
+python scripts/04_match_documents.py --regen --document-id N
+# or to re-match all documents:
+python scripts/04_match_documents.py --regen
+```
+
+Script 04 reads `match_feedback` on every run and automatically:
+- Raises the per-type threshold to `max_false_positive_score + FEEDBACK_PENALTY`
+- Excludes from the TF-IDF corpus any sample page with ≥ `SAMPLE_PAGE_EXCLUSION_COUNT` false-match records
+
+---
+
 ## Project Structure
 
 ```
@@ -211,12 +265,14 @@ Results are stored in `document_matches` with:
 ├── requirements.txt
 ├── db/
 │   ├── connection.py          # pyodbc context manager
-│   └── schema.sql             # DDL — run once against SQL Server
+│   ├── schema.sql             # DDL — run once against SQL Server
+│   └── schema_feedback.sql    # DDL — adds match_feedback table
 ├── scripts/
 │   ├── 01_inventory.py
 │   ├── 02_ocr_processor.py
 │   ├── 03_ingest_sample.py
-│   └── 04_match_documents.py
+│   ├── 04_match_documents.py
+│   └── 05_feedback.py
 └── utils/
     ├── ocr.py                 # Shared OCR logic (pdf2image + pytesseract)
     └── text_utils.py          # Text cleaning helpers
@@ -237,6 +293,8 @@ All settings are controlled via `.env`. Only `DB_*` values are required; the res
 | `DB_PASSWORD` | Yes | — | SQL login password |
 | `DB_DRIVER` | No | `ODBC Driver 18 for SQL Server` | Installed ODBC driver name |
 | `SIMILARITY_THRESHOLD` | No | `0.35` | Minimum score to record a match |
+| `FEEDBACK_PENALTY` | No | `0.05` | Added to the highest false-positive score to compute per-type threshold |
+| `SAMPLE_PAGE_EXCLUSION_COUNT` | No | `3` | False-match count at which a sample page is dropped from the corpus |
 | `OCR_DPI` | No | `300` | PDF render resolution |
 | `TESSERACT_LANG` | No | `eng` | Tesseract language(s) |
 

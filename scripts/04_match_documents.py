@@ -24,7 +24,43 @@ from db.connection import get_connection
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_sample_pages(conn) -> list[dict]:
+def load_feedback(conn) -> tuple[dict[str, float], set[tuple[int, int]]]:
+    """
+    Read match_feedback and return:
+      - type_thresholds: per document_type effective threshold
+      - excluded_sample_pages: set of (sample_id, page_number) pairs to exclude from corpus
+    """
+    cursor = conn.cursor()
+
+    # Per-type: highest false-positive score
+    cursor.execute(
+        """
+        SELECT document_type, MAX(confidence_score)
+        FROM match_feedback
+        GROUP BY document_type
+        """
+    )
+    type_thresholds: dict[str, float] = {}
+    for doc_type, max_score in cursor.fetchall():
+        recommended = max_score + config.FEEDBACK_PENALTY
+        type_thresholds[doc_type] = max(config.SIMILARITY_THRESHOLD, recommended)
+
+    # Sample pages with enough false matches to be excluded
+    cursor.execute(
+        """
+        SELECT matched_sample_id, matched_sample_page
+        FROM match_feedback
+        GROUP BY matched_sample_id, matched_sample_page
+        HAVING COUNT(*) >= ?
+        """,
+        config.SAMPLE_PAGE_EXCLUSION_COUNT,
+    )
+    excluded_sample_pages: set[tuple[int, int]] = {(r[0], r[1]) for r in cursor.fetchall()}
+
+    return type_thresholds, excluded_sample_pages
+
+
+def load_sample_pages(conn, excluded: set[tuple[int, int]] | None = None) -> list[dict]:
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -35,28 +71,47 @@ def load_sample_pages(conn) -> list[dict]:
         ORDER BY sp.sample_id, sp.page_number
         """
     )
-    return [
-        {
-            "sample_page_id": r[0],
-            "sample_id": r[1],
-            "document_type": r[2],
-            "page_number": r[3],
-            "text": r[4],
-        }
-        for r in cursor.fetchall()
-    ]
+    rows = cursor.fetchall()
+
+    pages = []
+    for r in rows:
+        sample_id, page_number = r[1], r[3]
+        if excluded and (sample_id, page_number) in excluded:
+            print(f"  [feedback] Excluding sample_id={sample_id}, page={page_number} from corpus (too many false matches)")
+            continue
+        pages.append(
+            {
+                "sample_page_id": r[0],
+                "sample_id": sample_id,
+                "document_type": r[2],
+                "page_number": page_number,
+                "text": r[4],
+            }
+        )
+    return pages
 
 
-def load_document_ids(conn, document_id: int | None) -> list[int]:
+def load_document_ids(conn, document_id: int | None, regen: bool) -> list[int]:
     cursor = conn.cursor()
     if document_id is not None:
         cursor.execute(
             "SELECT document_id FROM documents WHERE document_id = ? AND ocr_status = 'complete'",
             document_id,
         )
-    else:
+    elif regen:
+        # Re-process everything
         cursor.execute(
             "SELECT document_id FROM documents WHERE ocr_status = 'complete' ORDER BY document_id"
+        )
+    else:
+        # Only documents that have not been matched yet
+        cursor.execute(
+            """
+            SELECT document_id FROM documents
+            WHERE ocr_status = 'complete'
+              AND document_id NOT IN (SELECT DISTINCT document_id FROM document_matches)
+            ORDER BY document_id
+            """
         )
     return [r[0] for r in cursor.fetchall()]
 
@@ -100,12 +155,14 @@ def match_document(
     sample_pages: list[dict],
     vectorizer: TfidfVectorizer,
     sample_matrix,
+    type_thresholds: dict[str, float] | None = None,
 ) -> list[dict]:
     """
     Returns a list of match dicts ready to insert into document_matches.
     """
     MIN_WORDS = 20
-    threshold = config.SIMILARITY_THRESHOLD
+    if type_thresholds is None:
+        type_thresholds = {}
 
     eligible = [p for p in doc_pages if p["word_count"] >= MIN_WORDS]
     if not eligible:
@@ -147,6 +204,7 @@ def match_document(
             continue
         best_type = max(type_best, key=lambda dt: type_best[dt][0])
         score, sample_id, sample_page_num = type_best[best_type]
+        threshold = type_thresholds.get(best_type, config.SIMILARITY_THRESHOLD)
         if score < threshold:
             page_assignments.append(None)
         else:
@@ -240,8 +298,14 @@ def main():
     args = parser.parse_args()
 
     with get_connection() as conn:
+        print("Loading feedback...")
+        type_thresholds, excluded_sample_pages = load_feedback(conn)
+        if type_thresholds:
+            for dt, thr in sorted(type_thresholds.items()):
+                print(f"  [feedback] {dt}: effective threshold = {thr:.4f}")
+
         print("Loading sample pages...")
-        sample_pages = load_sample_pages(conn)
+        sample_pages = load_sample_pages(conn, excluded=excluded_sample_pages)
         if not sample_pages:
             print("No sample pages found. Run 03_ingest_sample.py first.")
             sys.exit(1)
@@ -249,7 +313,7 @@ def main():
         print(f"Fitting TF-IDF on {len(sample_pages)} sample pages...")
         vectorizer, sample_matrix = build_vectorizer(sample_pages)
 
-        doc_ids = load_document_ids(conn, args.document_id)
+        doc_ids = load_document_ids(conn, args.document_id, args.regen)
         if not doc_ids:
             print("No complete documents to match.")
             sys.exit(0)
@@ -265,7 +329,7 @@ def main():
             if args.regen:
                 delete_existing_matches(conn, doc_id)
 
-            matches = match_document(doc_id, doc_pages, sample_pages, vectorizer, sample_matrix)
+            matches = match_document(doc_id, doc_pages, sample_pages, vectorizer, sample_matrix, type_thresholds)
             insert_matches(conn, matches)
             total_matches += len(matches)
 
